@@ -1,0 +1,13 @@
+.gradle/
+.kotlin/
+.idea/
+build/
+app/build/
+third_party/**/build/
+local.properties
+analysis/
+docs/
+.codex-remote-attachments/
+dist/
+ir-recovery/
+*.apk
