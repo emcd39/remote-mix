@@ -7,6 +7,7 @@ import okio.BufferedSource
 import okio.buffer
 import okio.sink
 import okio.source
+import java.net.InetSocketAddress
 import java.net.Socket
 
 class TcpPacketTransport private constructor(
@@ -18,13 +19,18 @@ class TcpPacketTransport private constructor(
         suspend fun connect(
             host: String,
             port: Int = 5555,
+            connectTimeoutMs: Int = 10_000,
         ): TcpPacketTransport =
             withContext(Dispatchers.IO) {
-                val socket = Socket(host, port)
-                socket.tcpNoDelay = true
-                val source = socket.source().buffer()
-                val sink = socket.sink().buffer()
-                TcpPacketTransport(socket, source, sink)
+                val socket = Socket()
+                try {
+                    socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+                    socket.tcpNoDelay = true
+                    TcpPacketTransport(socket, socket.source().buffer(), socket.sink().buffer())
+                } catch (e: Exception) {
+                    runCatching { socket.close() }
+                    throw e
+                }
             }
     }
 
@@ -39,8 +45,6 @@ class TcpPacketTransport private constructor(
     override fun recv(): AdbPacket = AdbPacket.readFrom(source)
 
     override fun close() {
-        runCatching { source.close() }
-        runCatching { sink.close() }
         runCatching { socket.close() }
     }
 }

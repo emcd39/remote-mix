@@ -1,7 +1,8 @@
 package io.github.rhythmcache.adb.pairing
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import io.github.rhythmcache.adb.withDeadline
+import java.io.IOException
+import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
@@ -22,17 +23,18 @@ object PairingClient {
         ourPeerInfo: PeerInfo,
         identity: PairingIdentity,
         connectTimeoutMs: Int = 10_000,
-    ): Result<PairingResult> =
-        withContext(Dispatchers.IO) {
-            val socket = Socket()
-            try {
-                socket.connect(java.net.InetSocketAddress(host, port), connectTimeoutMs)
-                socket.tcpNoDelay = true
-            } catch (e: Exception) {
-                runCatching { socket.close() }
-                return@withContext Result.failure(e)
+        pairingTimeoutMs: Int = 15_000,
+    ): Result<PairingResult> {
+        return try {
+            Socket().use { socket ->
+                socket.withDeadline(pairingTimeoutMs) {
+                    socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+                    socket.tcpNoDelay = true
+                    PairingConnection.run(socket, ConnectionRole.CLIENT, password, ourPeerInfo, identity)
+                }
             }
-
-            PairingConnection.run(socket, ConnectionRole.CLIENT, password, ourPeerInfo, identity)
+        } catch (e: IOException) {
+            Result.failure(e)
         }
+    }
 }

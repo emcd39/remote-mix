@@ -33,6 +33,7 @@ class MainActivity : Activity() {
     private val panelText = UiPalette.panelText
     private val initialPalette = UiPalette.current.id
     private val worker = Executors.newSingleThreadExecutor()
+    private val irWorker = Executors.newSingleThreadExecutor()
     private lateinit var store: DeviceStore
     private lateinit var adb: AdbRemote
     private lateinit var bluetooth: BluetoothRemote
@@ -46,14 +47,16 @@ class MainActivity : Activity() {
     private lateinit var remotePanel: RemotePanel
     private lateinit var headerTitle: TextView
     @Volatile private var generation = 0
+    @Volatile private var irGeneration = 0
     private var displayedMode: ControlMode? = null
     private var appsLoading = false
+    private var pairingTicket: Int? = null
     private var adbDiscovery: AdbDiscovery? = null
     private var bluetoothDiscovery: BluetoothDeviceDiscovery? = null
-    private val bluetoothStatusListener: (String) -> Unit = { message ->
+    private val bluetoothStatusListener: (String, String?) -> Unit = { message, address ->
         runOnUiThread {
             if (::active.isInitialized && active.mode == ControlMode.BLUETOOTH && !isFinishing) {
-                showStatus(message)
+                if (address == null || address == active.bluetoothAddress) showStatus(message)
                 if (message.startsWith("蓝牙 HID 已就绪")) connectSavedBluetooth()
             }
         }
@@ -75,11 +78,15 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        bluetooth.setStatusListener(bluetoothStatusListener)
+        if (::bluetooth.isInitialized) bluetooth.setStatusListener(bluetoothStatusListener)
     }
 
     override fun onStop() {
-        bluetooth.clearStatusListener(bluetoothStatusListener)
+        irGeneration++
+        if (::bluetooth.isInitialized) {
+            if (displayedMode == ControlMode.BLUETOOTH) bluetooth.cancelPendingReports()
+            bluetooth.clearStatusListener(bluetoothStatusListener)
+        }
         super.onStop()
     }
 
@@ -169,6 +176,7 @@ class MainActivity : Activity() {
 
     private fun selectMode(mode: ControlMode) {
         generation++
+        irGeneration++
         appsLoading = false
         if (displayedMode == ControlMode.BLUETOOTH && mode != ControlMode.BLUETOOTH) bluetooth.cancelPendingReports()
         displayedMode = mode
@@ -198,7 +206,7 @@ class MainActivity : Activity() {
         when (mode) {
             ControlMode.ADB -> showStatus(if (active.adbHost.isBlank()) "请先设置电视的 ADB 地址" else "ADB ${if (active.adbTls) "TLS" else "TCP"} ${active.adbHost}:${active.adbPort} · 点击按键时连接")
             ControlMode.BLUETOOTH -> {
-                showStatus(bluetooth.connectedName()?.let { "蓝牙已连接：$it" }
+                showStatus(bluetooth.connectedName(active.bluetoothAddress)?.let { "蓝牙已连接：$it" }
                     ?: "蓝牙设备：${active.bluetoothAddress.ifBlank { "未选择" }}")
                 ensureBluetooth()
                 if (bluetooth.isReady()) connectSavedBluetooth()
@@ -212,6 +220,7 @@ class MainActivity : Activity() {
         val ticket = generation
         when (profile.mode) {
             ControlMode.ADB -> {
+                if (pairingTicket == ticket) return
                 if (profile.adbHost.isBlank()) { showStatus("请先设置 ADB 地址"); return }
                 showStatus("正在发送：${action.label}…")
                 worker.execute {
@@ -224,13 +233,16 @@ class MainActivity : Activity() {
                         .onFailure { error -> if (ticket == generation) runOnUiThread { showStatus("ADB：${error.message ?: "发送失败"}") } }
                 }
             }
-            ControlMode.BLUETOOTH -> runCatching { bluetooth.send(action) }
+            ControlMode.BLUETOOTH -> runCatching { bluetooth.send(profile.bluetoothAddress, action) }
                 .onFailure { showStatus(it.message ?: "蓝牙发送失败") }
             ControlMode.IR -> {
-                worker.execute {
-                    runCatching { ir.send(profile.irCodeId, action) }
-                        .onSuccess { if (ticket == generation) runOnUiThread { showStatus("红外“${action.label}”已发送") } }
-                        .onFailure { if (ticket == generation) runOnUiThread { showStatus(it.message ?: "红外发送失败") } }
+                val irTicket = irGeneration
+                val codeId = profile.irCodeId
+                irWorker.execute {
+                    if (irTicket != irGeneration) return@execute
+                    runCatching { ir.send(codeId, action) { irTicket == irGeneration } }
+                        .onSuccess { runOnUiThread { if (irTicket == irGeneration) showStatus("红外“${action.label}”已发送") } }
+                        .onFailure { runOnUiThread { if (irTicket == irGeneration) showStatus(it.message ?: "红外发送失败") } }
                 }
             }
         }
@@ -238,7 +250,7 @@ class MainActivity : Activity() {
 
     private fun openApps() {
         val profile = active
-        if (profile.mode != ControlMode.ADB || appsLoading) return
+        if (profile.mode != ControlMode.ADB || appsLoading || pairingTicket == generation) return
         if (profile.adbHost.isBlank()) { showStatus("请先设置 ADB 地址"); return }
         val ticket = generation
         appsLoading = true
@@ -370,21 +382,35 @@ class MainActivity : Activity() {
         form.addView(host); form.addView(port); form.addView(code)
         AlertDialog.Builder(this).setTitle("无线调试配对").setView(form)
             .setPositiveButton("配对") { _, _ ->
-                val profile = active
+                val profileId = active.id
+                val ticket = ++generation
+                pairingTicket = ticket
+                appsLoading = false
                 val address = host.text.toString().trim()
                 val number = port.text.toString().toIntOrNull() ?: 0
                 val secret = code.text.toString().trim()
                 showStatus("正在配对…")
                 worker.execute {
+                    if (ticket != generation) return@execute
                     runCatching { adb.pair(address, number, secret) }
                         .onSuccess { fingerprint -> runOnUiThread {
-                            profile.adbHost = address
-                            profile.adbTls = true
-                            profile.adbPeerFingerprint = fingerprint
-                            store.save(devices)
+                            if (ticket != generation || isFinishing || isDestroyed || active.id != profileId) return@runOnUiThread
+                            pairingTicket = null
+                            val updated = store.update(profileId) { profile ->
+                                profile.adbHost = address
+                                profile.adbTls = true
+                                profile.adbPeerFingerprint = fingerprint
+                            } ?: return@runOnUiThread
+                            devices = updated
+                            active = updated.first { it.id == profileId }
                             showStatus("配对完成，请在设备设置中填写无线调试的连接端口")
                         } }
-                        .onFailure { runOnUiThread { showStatus("配对失败：${it.message}") } }
+                        .onFailure { runOnUiThread {
+                            if (ticket == generation && !isFinishing && !isDestroyed) {
+                                pairingTicket = null
+                                showStatus("配对失败：${it.message}")
+                            }
+                        } }
                 }
             }.setNegativeButton("取消", null).show()
     }
@@ -528,6 +554,7 @@ class MainActivity : Activity() {
         val code = data?.getStringExtra("code_id") ?: return
         val profile = devices.firstOrNull { it.id == data.getStringExtra("profile_id") } ?: return
         profile.irCodeId = code
+        irGeneration++
         store.save(devices)
         if (profile.id == active.id) showStatus("红外遥控器已匹配，可用下面的按键测试：$code")
     }
@@ -556,11 +583,13 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         generation++
+        irGeneration++
         adbDiscovery?.stop()
         bluetoothDiscovery?.close()
         if (::bluetooth.isInitialized) bluetooth.cancelPendingReports()
         if (::adb.isInitialized) worker.execute { adb.disconnect() }
         worker.shutdown()
+        irWorker.shutdownNow()
         super.onDestroy()
     }
 }

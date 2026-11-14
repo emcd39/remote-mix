@@ -6,6 +6,9 @@ import android.hardware.ConsumerIrManager
 import org.json.JSONArray
 import java.io.File
 
+private val verificationKeys = listOf("up", "ok", "vol+", "ch+", "menu", "back", "exit", "down",
+    "left", "right", "vol-", "ch-", "mute", "home", "input", "tv_av", "play", "pause")
+
 data class IrBrand(val name: String, val count: Int) {
     val label: String get() = "${if (name == "未知品牌") "通用／其他" else name} · $count 套"
 }
@@ -57,39 +60,41 @@ class IrRemote(private val context: Context) {
     }
 
     fun matchCandidates(deviceId: String, brand: String, regionId: Int? = null, parentRegionId: Int? = null): List<IrMatchCandidate> {
-        val found = mutableListOf<IrMatchCandidate>()
+        val powerSignals = linkedMapOf<String, String>()
+        val signals = mutableMapOf<String, MutableMap<String, String>>()
+        val priority = if (deviceId == "1") listOf("vol+", "ch+", "up") + verificationKeys else verificationKeys
+        val keys = priority.distinct()
+        val placeholders = keys.joinToString(",") { "?" }
         val cursor = database.rawQuery(
-            "SELECT r.code_id,r.frequency_hz,p.pattern_us_json," +
-                "(SELECT k.key_id FROM keys k WHERE k.code_id=r.code_id " +
-                "AND k.key_id IN ('vol+','up','ok','ch+','menu') " +
-                "ORDER BY CASE k.key_id " +
-                (if (deviceId == "1") "WHEN 'vol+' THEN 0 WHEN 'ch+' THEN 1 WHEN 'up' THEN 2 "
-                 else "WHEN 'up' THEN 0 WHEN 'ok' THEN 1 WHEN 'vol+' THEN 2 ") +
-                "ELSE 3 END LIMIT 1) " +
+            "SELECT r.code_id,r.frequency_hz,p.pattern_us_json,k.key_id,k.pattern_us_json " +
                 "FROM remotes r JOIN keys p ON p.code_id=r.code_id AND p.key_id='power' " +
+                "JOIN keys k ON k.code_id=r.code_id AND k.key_id IN ($placeholders) " +
                 "WHERE r.device_id=? AND r.brand_name=? " +
                 "ORDER BY CASE WHEN ? != '' AND r.sp_id=? THEN 0 " +
                 "WHEN ? != '' AND r.sp_id=? THEN 1 ELSE 2 END,r.match_rank,r.code_id",
-            arrayOf(deviceId, brand,
+            keys.toTypedArray() + arrayOf(deviceId, brand,
                 regionId?.toString() ?: "", regionId?.toString() ?: "",
                 parentRegionId?.toString() ?: "", parentRegionId?.toString() ?: "")
         )
         try {
             while (cursor.moveToNext()) {
-                val verifyKey = cursor.getString(3) ?: continue
-                found += IrMatchCandidate(
-                    cursor.getString(0), "${cursor.getInt(1)}:${cursor.getString(2)}", verifyKey
-                )
+                val codeId = cursor.getString(0)
+                val keySignals = signals.getOrPut(codeId) { mutableMapOf() }
+                powerSignals.getOrPut(codeId) { "${cursor.getInt(1)}:${cursor.getString(2)}" }
+                keySignals[cursor.getString(3)] = cursor.getString(4)
             }
         } finally {
             cursor.close()
         }
-        return found
+        return powerSignals.map { (codeId, power) ->
+            val keySignals = signals.getValue(codeId)
+            IrMatchCandidate(codeId, power, keys.mapNotNull { key -> keySignals[key]?.let { key to it } }.toMap())
+        }
     }
 
     fun sendTest(codeId: String, keyId: String) = transmit(codeId, listOf(keyId))
 
-    fun send(codeId: String, action: RemoteAction) {
+    fun send(codeId: String, action: RemoteAction, isCurrent: () -> Boolean) {
         val alternatives = when (action) {
             RemoteAction.BACK -> listOf("back", "exit")
             RemoteAction.HOME -> listOf("home", "menu")
@@ -97,10 +102,10 @@ class IrRemote(private val context: Context) {
             RemoteAction.PLAY_PAUSE -> listOf("play", "pause")
             else -> listOf(action.irKey)
         }
-        transmit(codeId, alternatives)
+        transmit(codeId, alternatives, isCurrent)
     }
 
-    private fun transmit(codeId: String, alternatives: List<String>) {
+    private fun transmit(codeId: String, alternatives: List<String>, isCurrent: () -> Boolean = { true }) {
         val ir = emitter ?: error("手机没有红外发射器")
         check(ir.hasIrEmitter()) { "手机没有红外发射器" }
         check(codeId.isNotBlank()) { "请先匹配红外遥控器" }
@@ -116,7 +121,7 @@ class IrRemote(private val context: Context) {
             check(cursor.moveToFirst()) { "此码组没有“${alternatives.first()}”按键，请重新匹配" }
             val pattern = JSONArray(cursor.getString(1))
             val pulses = IntArray(pattern.length()) { pattern.getInt(it) }
-            ir.transmit(cursor.getInt(0), pulses)
+            if (isCurrent()) ir.transmit(cursor.getInt(0), pulses)
         } finally {
             cursor.close()
         }

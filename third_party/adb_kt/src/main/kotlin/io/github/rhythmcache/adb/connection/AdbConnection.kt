@@ -3,6 +3,7 @@ package io.github.rhythmcache.adb
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -11,16 +12,19 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.security.KeyPair
 import java.security.interfaces.RSAPublicKey
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class AdbConnection private constructor(
     private val openChannel: Channel<StreamReg>,
     private val sharedCmdChannel: Channel<StreamCmd>,
     private val scope: CoroutineScope,
+    private val closeTransport: () -> Unit,
     val deviceMode: AdbDeviceMode = AdbDeviceMode.UNKNOWN,
     val bannerString: String = "",
     val maxPayload: Int = 4096,
@@ -60,11 +64,16 @@ class AdbConnection private constructor(
             var detectedMaxPayload = 4096
 
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val transportClosed = AtomicBoolean(false)
+            val closeTransport: () -> Unit = {
+                if (transportClosed.compareAndSet(false, true)) runCatching { transport.close() }
+            }
 
             scope.launch {
                 try {
                     ioLoop(
                         transport,
+                        closeTransport,
                         streams,
                         streamsMutex,
                         sharedCmdChannel,
@@ -78,21 +87,32 @@ class AdbConnection private constructor(
                         detectedMaxPayload = payloadSize
                     }
                 } finally {
+                    closeTransport()
+                    val error = AdbException.StreamClosed()
+                    regChannel.close(error)
+                    sharedCmdChannel.close(error)
+                    withContext(NonCancellable) {
+                        broadcastError(streams, streamsMutex, error)
+                        streamsMutex.withLock { streams.clear() }
+                    }
                     scope.cancel()
                 }
             }
 
-            withTimeoutOrNull(handshakeTimeoutMs) {
-                handshakeResult.await()
-            } ?: run {
+            try {
+                withTimeoutOrNull(handshakeTimeoutMs) { handshakeResult.await() }
+                    ?: throw AdbException.Timeout("ADB CNXN/AUTH handshake timed out")
+            } catch (e: Exception) {
+                closeTransport()
                 scope.cancel()
-                throw AdbException.Timeout("ADB CNXN/AUTH handshake timed out")
+                throw e
             }
 
             return AdbConnection(
                 openChannel = regChannel,
                 sharedCmdChannel = sharedCmdChannel,
                 scope = scope,
+                closeTransport = closeTransport,
                 deviceMode = detectedMode,
                 bannerString = detectedBanner,
                 maxPayload = detectedMaxPayload,
@@ -116,6 +136,7 @@ class AdbConnection private constructor(
 
         private suspend fun ioLoop(
             transport: PacketTransport,
+            closeTransport: () -> Unit,
             streams: HashMap<Int, StreamShared>,
             streamsMutex: Mutex,
             cmdChannel: Channel<StreamCmd>,
@@ -184,6 +205,7 @@ class AdbConnection private constructor(
                             transport.send(AdbPacket(AdbCmd.OPEN, reg.localId, 0, payload))
                         } catch (e: Exception) {
                             broadcastError(streams, streamsMutex, e)
+                            closeTransport()
                             break
                         }
                     }
@@ -209,6 +231,7 @@ class AdbConnection private constructor(
                                 transport.send(pkt)
                             } catch (e: Exception) {
                                 broadcastError(streams, streamsMutex, e)
+                                closeTransport()
                                 break
                             }
                         }
@@ -218,8 +241,6 @@ class AdbConnection private constructor(
             readerJob.join()
             regJob.cancel()
             cmdJob.cancel()
-            streamsMutex.withLock { streams.clear() }
-            transport.close()
         }
 
         private suspend fun dispatch(
@@ -312,7 +333,7 @@ class AdbConnection private constructor(
         ) {
             streamsMutex.withLock {
                 for (entry in streams.values) {
-                    entry.dataChannel.trySend(Result.failure(e))
+                    entry.dataChannel.close(e)
                     entry.openSignal?.completeExceptionally(e)
                 }
             }
@@ -326,12 +347,13 @@ class AdbConnection private constructor(
     ): AdbStream {
         val localId = nextLocalId()
         val shared = StreamShared(maxPayload = maxPayload)
+        val openSignal = requireNotNull(shared.openSignal)
 
         openChannel.send(StreamReg(localId, service, shared))
 
         val remoteId =
             withTimeoutOrNull(openTimeoutMs) {
-                shared.openSignal!!.await()
+                openSignal.await()
             } ?: run {
                 sharedCmdChannel.trySend(StreamCmd.AbortOpen(localId))
                 throw AdbException.Timeout("Failed to open stream for '$service': timeout")
@@ -350,6 +372,7 @@ class AdbConnection private constructor(
     val isClosed: Boolean get() = !scope.isActive
 
     override fun close() {
+        closeTransport()
         scope.cancel()
     }
 }

@@ -8,3 +8,5 @@
 | `spake2_kt` | https://github.com/rhythmcache/spake2-kt | `v1.0.2` / `68988da95a5d1550ba2c85c491938d2b5dfbbc4e` |
 
 仅复制 `src/main` 源码与许可证，使用本工程的 Gradle 配置构建。两个模块的功能和许可独立于参考 APK。本地修改了 `adb_kt` 的 TLS 连接入口：要求传入配对时记录的设备证书 SHA-256 指纹，并在 TLS 握手时核对，避免把任意自签证书当成已配对电视。
+
+本地还为 TCP 连接、TLS 升级和无线配对设置了超时。关闭 ADB 会话时先关闭底层套接字，使正在等待数据的线程退出。

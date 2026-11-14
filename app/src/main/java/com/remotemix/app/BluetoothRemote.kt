@@ -18,8 +18,8 @@ class BluetoothRemote(context: Context) {
     private val context = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private val adapter: BluetoothAdapter? = context.getSystemService(BluetoothManager::class.java)?.adapter
-    private var statusListener: ((String) -> Unit)? = null
-    private var lastStatus = ""
+    private var statusListener: ((String, String?) -> Unit)? = null
+    private var lastStatus: Pair<String, String?>? = null
     private var hid: BluetoothHidDevice? = null
     private var device: BluetoothDevice? = null
     private var ready = false
@@ -39,20 +39,20 @@ class BluetoothRemote(context: Context) {
                 !registered -> "蓝牙 HID 已停止，请返回蓝牙界面重试"
                 pluggedDevice != null -> "蓝牙已连接：${pluggedDevice.name ?: pluggedDevice.address}"
                 else -> "蓝牙 HID 已就绪，请选已配对设备"
-            })
+            }, pluggedDevice?.address?.takeIf { registered })
         }
 
         override fun onConnectionStateChanged(remoteDevice: BluetoothDevice, state: Int) {
             if (state == BluetoothProfile.STATE_CONNECTED) {
                 device = remoteDevice
                 connectingAddress = null
-                emit("蓝牙已连接：${remoteDevice.name ?: remoteDevice.address}")
+                emit("蓝牙已连接：${remoteDevice.name ?: remoteDevice.address}", remoteDevice.address)
             } else if (state == BluetoothProfile.STATE_DISCONNECTED &&
                 (device?.address == remoteDevice.address || connectingAddress == remoteDevice.address)) {
                 generation++
                 device = null
                 connectingAddress = null
-                emit("蓝牙连接已断开")
+                emit("蓝牙连接已断开", remoteDevice.address)
             }
         }
     }
@@ -77,21 +77,23 @@ class BluetoothRemote(context: Context) {
         }
     }
 
-    fun setStatusListener(listener: ((String) -> Unit)?) {
+    fun setStatusListener(listener: (String, String?) -> Unit) {
         statusListener = listener
-        if (listener != null && lastStatus.isNotEmpty()) listener(lastStatus)
+        lastStatus?.let { (message, address) -> listener(message, address) }
     }
 
-    fun clearStatusListener(listener: (String) -> Unit) {
+    fun clearStatusListener(listener: (String, String?) -> Unit) {
         if (statusListener === listener) statusListener = null
     }
 
-    fun currentStatus() = lastStatus
     fun isReady() = ready
     fun connectedAddress() = device?.address?.takeIf { ready }
-    fun connectedName() = device?.takeIf { ready }?.let { it.name ?: it.address }
+    fun connectedName(address: String) = device?.takeIf { ready && it.address == address }?.let { it.name ?: it.address }
 
-    private fun emit(message: String) { lastStatus = message; statusListener?.invoke(message) }
+    private fun emit(message: String, address: String? = null) {
+        lastStatus = message to address
+        statusListener?.invoke(message, address)
+    }
 
     private fun register(service: BluetoothHidDevice) {
         if (ready || registering) return
@@ -134,7 +136,7 @@ class BluetoothRemote(context: Context) {
             connectingAddress = null
             error("电视拒绝蓝牙连接，请先在电视上配对")
         }
-        emit("正在连接 ${remoteDevice.name ?: remoteDevice.address}…")
+        emit("正在连接 ${remoteDevice.name ?: remoteDevice.address}…", remoteDevice.address)
     }
 
     fun isConnected() = device != null && ready
@@ -152,8 +154,9 @@ class BluetoothRemote(context: Context) {
         nextPressAt = SystemClock.uptimeMillis()
     }
 
-    fun send(action: RemoteAction) {
-        val target = device ?: error("蓝牙尚未连接")
+    fun send(address: String, action: RemoteAction) {
+        check(address.isNotBlank()) { "请先为当前设备选择蓝牙连接" }
+        val target = device?.takeIf { ready && it.address == address } ?: error("当前设备尚未连接蓝牙")
         val service = hid ?: error("蓝牙 HID 尚未就绪")
         val (reportId, pressed) = pressed(action)
         val released = ByteArray(pressed.size)
@@ -166,16 +169,16 @@ class BluetoothRemote(context: Context) {
                 runCatching { service.sendReport(target, reportId, pressed) }
                     .onSuccess { accepted ->
                         if (accepted) pressedAccepted.set(true)
-                        emit(if (accepted) "蓝牙已发送：${action.label}" else "蓝牙按键发送失败：电视连接未接受报告")
+                        emit(if (accepted) "蓝牙已发送：${action.label}" else "蓝牙按键发送失败：电视连接未接受报告", address)
                     }
-                    .onFailure { error -> emit("蓝牙按键发送失败：${error.message ?: "蓝牙服务异常"}") }
+                    .onFailure { error -> emit("蓝牙按键发送失败：${error.message ?: "蓝牙服务异常"}", address) }
             }
         }, at)
         handler.postAtTime({
             if (pressedAccepted.get() && target == device) {
                 runCatching { service.sendReport(target, reportId, released) }
-                    .onSuccess { accepted -> if (!accepted) emit("蓝牙松键报告发送失败") }
-                    .onFailure { error -> emit("蓝牙松键失败：${error.message ?: "蓝牙服务异常"}") }
+                    .onSuccess { accepted -> if (!accepted) emit("蓝牙松键报告发送失败", address) }
+                    .onFailure { error -> emit("蓝牙松键失败：${error.message ?: "蓝牙服务异常"}", address) }
             }
         }, at + 45)
     }

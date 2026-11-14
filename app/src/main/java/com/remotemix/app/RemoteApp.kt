@@ -43,6 +43,11 @@ object RemoteAppCatalog {
 
     fun isSafeComponent(component: String) = componentLine.matches(component)
 
+    fun launchCommand(component: String): String {
+        require(isSafeComponent(component)) { "应用启动入口无效" }
+        return "am start -n '$component'"
+    }
+
     /** Metadata lines are emitted by the shell-side read-only catalog helper. */
     fun parseMetadata(output: String): List<RemoteApp> {
         val declared = output.lineSequence().firstOrNull { it.startsWith("RMAPP_READY\t") }

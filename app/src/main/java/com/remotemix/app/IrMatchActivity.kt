@@ -234,7 +234,7 @@ class IrMatchActivity : Activity() {
         page.addView(label("第 ${probe.groupNumber} / ${probe.groupCount} 套方案", 15f, muted).apply { gravity = Gravity.CENTER })
         page.addView(label(
             if (probe.phase == IrMatchPhase.POWER) "先测试电源键"
-            else "电源有响应，再验证第 ${probe.variantNumber} / ${probe.variantCount} 套的其他按键",
+            else "电源有响应，验证第 ${probe.variantNumber} / ${probe.variantCount} 套 · 按键 ${probe.verifyNumber} / ${probe.verifyCount}",
             14f, muted
         ).apply { gravity = Gravity.CENTER })
         page.addView(gap(18))
@@ -306,7 +306,7 @@ class IrMatchActivity : Activity() {
         stage = Stage.SUCCESS
         completedCode = codeId
         shell("匹配完成", "设备有响应")
-        page.addView(label("电源和另一个按键均已得到您的确认。", 18f, ink, true))
+        page.addView(label("电源和复核按键均已得到您的确认。", 18f, ink, true))
         page.addView(gap(18))
         page.addView(label("码组：$codeId", 14f, muted))
         page.addView(gap(24))
@@ -420,6 +420,10 @@ class IrMatchActivity : Activity() {
     private fun keyLabel(key: String) = when (key) {
         "power" -> "电源"; "vol+" -> "音量+"; "up" -> "方向上"
         "ok" -> "确定"; "ch+" -> "频道+"; "menu" -> "菜单"
+        "back", "exit" -> "返回"
+        "down" -> "方向下"; "left" -> "方向左"; "right" -> "方向右"
+        "vol-" -> "音量−"; "ch-" -> "频道−"; "mute" -> "静音"
+        "home" -> "主页"; "input", "tv_av" -> "信号源"; "play" -> "播放"; "pause" -> "暂停"
         else -> key
     }
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()

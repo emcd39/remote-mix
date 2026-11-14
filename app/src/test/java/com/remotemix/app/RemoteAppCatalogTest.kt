@@ -15,6 +15,12 @@ class RemoteAppCatalogTest {
         assertEquals("org.xbmc.kodi/.Splash", entries.first { it.packageName == "org.xbmc.kodi" }.component)
     }
 
+    @Test fun launchKeepsNestedActivityNameLiteralForTheRemoteShell() {
+        val component = "com.example.tv/.Outer\$Launcher"
+        val app = RemoteAppCatalog.parse(component, "").single()
+        assertEquals("am start -n 'com.example.tv/.Outer\$Launcher'", RemoteAppCatalog.launchCommand(app.component))
+    }
+
     @Test fun ignoresHeadersErrorsAndShellMetacharacters() {
         val entries = RemoteAppCatalog.parse(
             "2 activities found:\n Activity #0:\ncom.safe.app/.Main\ncom.bad.app/.Main;reboot",

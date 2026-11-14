@@ -1,8 +1,6 @@
 package io.github.rhythmcache.adb
 
 import io.github.rhythmcache.adb.pairing.PairingIdentity
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import okio.BufferedSink
 import okio.BufferedSource
 import okio.buffer
@@ -20,13 +18,13 @@ import org.bouncycastle.tls.TlsAuthentication
 import org.bouncycastle.tls.TlsClientContext
 import org.bouncycastle.tls.TlsClientProtocol
 import org.bouncycastle.tls.TlsCredentials
-import org.bouncycastle.tls.TlsProtocol
 import org.bouncycastle.tls.TlsServerCertificate
 import org.bouncycastle.tls.crypto.TlsCertificate
 import org.bouncycastle.tls.crypto.TlsCrypto
 import org.bouncycastle.tls.crypto.TlsCryptoParameters
 import org.bouncycastle.tls.crypto.impl.bc.BcDefaultTlsCredentialedSigner
 import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -51,7 +49,6 @@ import org.bouncycastle.asn1.x509.Certificate as ASN1Certificate
  */
 class TlsPacketTransport private constructor(
     private val socket: Socket,
-    private val protocol: TlsProtocol,
     private val source: BufferedSource,
     private val sink: BufferedSink,
 ) : PacketTransport {
@@ -64,10 +61,22 @@ class TlsPacketTransport private constructor(
             port: Int,
             identity: PairingIdentity,
             trustedServerCertificateSha256: ByteArray,
-        ): TlsPacketTransport =
-            withContext(Dispatchers.IO) {
+            handshakeTimeoutMs: Int = 10_000,
+        ): TlsPacketTransport {
+            val socket = Socket()
+            try {
+                return socket.withDeadline(handshakeTimeoutMs) {
+                    socket.connect(InetSocketAddress(host, port), handshakeTimeoutMs)
+                    upgrade(socket, identity, trustedServerCertificateSha256)
+                }
+            } catch (e: Exception) {
+                runCatching { socket.close() }
+                throw e
+            }
+        }
+
+        private fun upgrade(socket: Socket, identity: PairingIdentity, trustedServerCertificateSha256: ByteArray): TlsPacketTransport {
                 require(trustedServerCertificateSha256.size == 32) { "Expected SHA-256 device certificate fingerprint" }
-                val socket = Socket(host, port)
                 socket.tcpNoDelay = true
 
                 val crypto: TlsCrypto = sharedCrypto
@@ -172,22 +181,18 @@ class TlsPacketTransport private constructor(
                 try {
                     protocol.connect(client) // blocks until handshake completes or throws
                 } catch (e: org.bouncycastle.tls.TlsFatalAlert) {
-                    runCatching { protocol.close() }
-                    runCatching { socket.close() }
                     if (isCertRejectionAlert(e.alertDescription)) {
                         throw AdbException.NotPaired(cause = e)
                     }
                     throw AdbException.Transport("TLS handshake failed", e)
                 } catch (e: Exception) {
-                    runCatching { protocol.close() }
-                    runCatching { socket.close() }
                     throw AdbException.Transport("TLS handshake failed", e)
                 }
 
                 val source = protocol.inputStream.source().buffer()
                 val sink = protocol.outputStream.sink().buffer()
 
-                TlsPacketTransport(socket, protocol, source, sink)
+                return TlsPacketTransport(socket, source, sink)
             }
 
         private fun isCertRejectionAlert(desc: Short): Boolean =
@@ -257,9 +262,6 @@ class TlsPacketTransport private constructor(
     }
 
     override fun close() {
-        runCatching { source.close() }
-        runCatching { sink.close() }
-        runCatching { protocol.close() }
         runCatching { socket.close() }
     }
 }

@@ -47,6 +47,15 @@ class DeviceStore(context: Context) {
         prefs.edit().putString("profiles", array.toString()).apply()
     }
 
+    // Profile edits and pairing results run on the main thread.
+    fun update(id: String, change: (DeviceProfile) -> Unit): MutableList<DeviceProfile>? {
+        val profiles = load()
+        val profile = profiles.firstOrNull { it.id == id } ?: return null
+        change(profile)
+        save(profiles)
+        return profiles
+    }
+
     fun activeId(): String = prefs.getString("active", "") ?: ""
     fun setActiveId(id: String) { prefs.edit().putString("active", id).apply() }
 }
